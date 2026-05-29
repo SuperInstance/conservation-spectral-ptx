@@ -93,3 +93,5 @@ CPU vs CUDA C vs Inline PTX comparison measuring:
 ## License
 
 MIT
+
+Part of the [SuperInstance OpenConstruct](https://github.com/SuperInstance/OpenConstruct) ecosystem.
