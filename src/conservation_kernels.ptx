@@ -1,0 +1,318 @@
+//
+// conservation_kernels.ptx — PTX assembly for Conservation Spectral SDK
+//
+// Kernels: laplacian, power_iteration, conservation
+// Target: sm_75 (Turing) — compatible with nvcc 11.5
+// Explicit register allocation, warp shuffle reductions
+//
+// Register allocation strategy:
+//   R0-R7:   Loop counters, indices, addresses
+//   R8-R15:  Accumulators (float)
+//   R16-R23: Temporary computation
+//   R24-R31: Warp shuffle operands, predicates
+//
+// NOTE: This is hand-written PTX demonstrating low-level GPU programming.
+//       For production, use the inline PTX approach (inline_ptx.cu) which
+//       lets nvcc handle ABI/prologue while we inject warp-level intrinsics.
+//
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+//----------------------------------------------------------------------------
+// Externally visible symbols (matched by driver.cu via cuModuleGetFunction)
+//----------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------
+// kernel_laplacian
+//   Computes L = D - A for a graph stored in row-major float[]
+//   Params:
+//     R0 = pointer to adjacency matrix (input, N x N floats)
+//     R1 = pointer to degree vector (input, N floats)
+//     R2 = pointer to laplacian matrix (output, N x N floats)
+//     R3 = N (number of nodes)
+//----------------------------------------------------------------------------
+.visible .entry kernel_laplacian(
+    .param .u64 adj_ptr,
+    .param .u64 deg_ptr,
+    .param .u64 lap_ptr,
+    .param .u32 n_nodes
+)
+{
+    .reg .u64   %rd<8>;     // rd0-rd7: pointer / address registers
+    .reg .u32   %r<8>;      // r0-r7: integer registers
+    .reg .f32   %f<16>;     // f0-f15: float registers
+    .reg .pred  %p<4>;      // p0-p3: predicate registers
+
+    // Load parameters
+    ld.param.u64    %rd0, [adj_ptr];    // adjacency base
+    ld.param.u64    %rd1, [deg_ptr];    // degree base
+    ld.param.u64    %rd2, [lap_ptr];    // laplacian base
+    ld.param.u32    %r0, [n_nodes];     // N
+
+    // Linear thread index = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.u32      %r4, %r1, %r2, %r3;   // r4 = global thread id
+
+    // If tid >= N*N, exit
+    mul.lo.u32      %r5, %r0, %r0;        // r5 = N*N
+    setp.ge.u32     %p0, %r4, %r5;
+    @%p0 bra        $exit;
+
+    // row = tid / N, col = tid % N
+    div.u32         %r6, %r4, %r0;        // r6 = row
+    rem.u32         %r7, %r4, %r0;        // r7 = col
+
+    // Load degree[row]
+    shl.b32         %r1, %r6, 2;           // r1 = row * 4 (byte offset)
+    add.u64         %rd3, %rd1, %r1;
+    cvta.to.global.u64 %rd3, %rd3;
+    ld.global.f32   %f0, [%rd3];           // f0 = degree[row]
+
+    // Load adjacency[row * N + col]
+    shl.b32         %r2, %r4, 2;           // r2 = linear * 4
+    add.u64         %rd4, %rd0, %r2;
+    cvta.to.global.u64 %rd4, %rd4;
+    ld.global.f32   %f1, [%rd4];           // f1 = A[row][col]
+
+    // laplacian[row][col] = degree[row] - adjacency[row][col]
+    // But diagonal: L[i][i] = degree[i], off-diag: L[i][j] = -A[i][j]
+    setp.eq.u32     %p1, %r6, %r7;        // diagonal?
+    sub.f32         %f2, 0f00000000, %f1;  // f2 = -A[i][j]
+
+    // Select: diagonal -> degree, off-diag -> -A[i][j]
+    selp.f32        %f3, %f0, %f2, %p1;   // f3 = result
+
+    // Store
+    add.u64         %rd5, %rd2, %r2;
+    cvta.to.global.u64 %rd5, %rd5;
+    st.global.f32   [%rd5], %f3;
+
+$exit:
+    ret;
+}
+
+//----------------------------------------------------------------------------
+// kernel_power_iteration
+//   One step of power iteration: v_out = L * v_in / ||L * v_in||
+//   Uses warp shuffle for partial reductions (norm computation)
+//   Params:
+//     R0 = pointer to matrix L (N x N)
+//     R1 = pointer to v_in (N floats)
+//     R2 = pointer to v_out (N floats)
+//     R3 = pointer to norm_out (1 float, reduction result)
+//     R4 = N
+//----------------------------------------------------------------------------
+.visible .entry kernel_power_iteration(
+    .param .u64 mat_ptr,
+    .param .u64 vin_ptr,
+    .param .u64 vout_ptr,
+    .param .u64 norm_ptr,
+    .param .u32 n_nodes
+)
+{
+    .reg .u64   %rd<8>;
+    .reg .u32   %r<12>;
+    .reg .f32   %f<24>;     // Extended float registers for accumulation
+    .reg .pred  %p<4>;
+
+    ld.param.u64    %rd0, [mat_ptr];
+    ld.param.u64    %rd1, [vin_ptr];
+    ld.param.u64    %rd2, [vout_ptr];
+    ld.param.u64    %rd3, [norm_ptr];
+    ld.param.u32    %r0, [n_nodes];        // N
+
+    // Thread id
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.u32      %r4, %r1, %r2, %r3;   // global tid
+
+    // Each thread computes one output element: v_out[row] = sum_j L[row][j] * v[j]
+    setp.ge.u32     %p0, %r4, %r0;
+    @%p0 bra        $norm_reduce;
+
+    // Accumulator for dot product
+    mov.f32         %f0, 0f00000000;       // accumulator = 0
+
+    // Loop over columns j = 0..N-1
+    mov.u32         %r5, 0;                // j = 0
+
+$dot_loop:
+    setp.ge.u32     %p1, %r5, %r0;
+    @%p1 bra        $dot_done;
+
+    // Compute address: L[row * N + j]
+    mad.lo.u32      %r6, %r4, %r0, %r5;   // r6 = row * N + j
+    shl.b32         %r7, %r6, 2;           // byte offset
+    add.u64         %rd4, %rd0, %r7;
+    cvta.to.global.u64 %rd4, %rd4;
+    ld.global.f32   %f1, [%rd4];           // f1 = L[row][j]
+
+    // Load v[j]
+    shl.b32         %r7, %r5, 2;
+    add.u64         %rd5, %rd1, %r7;
+    cvta.to.global.u64 %rd5, %rd5;
+    ld.global.f32   %f2, [%rd5];           // f2 = v[j]
+
+    // acc += L[row][j] * v[j]
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // j++
+    add.u32         %r5, %r5, 1;
+    bra             $dot_loop;
+
+$dot_done:
+    // Store v_out[row] = acc
+    shl.b32         %r7, %r4, 2;
+    add.u64         %rd4, %rd2, %r7;
+    cvta.to.global.u64 %rd4, %rd4;
+    st.global.f32   [%rd4], %f0;
+
+$norm_reduce:
+    // ---- Warp shuffle reduction for norm computation ----
+    // Each thread has %f0 = its v_out value (or 0 if out of range)
+    // We compute ||v_out||^2 via warp-level shuffles, then finalize across warps
+
+    setp.ge.u32     %p0, %r4, %r0;
+    selp.f32        %f3, 0f00000000, %f0, %p0; // zero if out of range
+
+    // f3 = value for norm, compute f3 * f3
+    mul.f32         %f4, %f3, %f3;            // local contribution
+
+    // Warp shuffle reduction: sum across warp
+    // shfl.sync.b32 dst, src, lane, mask, membermask
+    // mask = 0xFFFFFFFF (all 32 lanes)
+    mov.u32         %r8, 0xFFFFFFFF;           // membermask
+
+    // Shuffle from lane + 16 and add
+    mov.u32         %r9, 16;
+    shfl.sync.b32   %f5, %f4, %r9, %r8;       // f5 = peer value from lane+16
+    add.f32         %f4, %f4, %f5;
+
+    // Shuffle from lane + 8
+    mov.u32         %r9, 8;
+    shfl.sync.b32   %f5, %f4, %r9, %r8;
+    add.f32         %f4, %f4, %f5;
+
+    // Shuffle from lane + 4
+    mov.u32         %r9, 4;
+    shfl.sync.b32   %f5, %f4, %r9, %r8;
+    add.f32         %f4, %f4, %f5;
+
+    // Shuffle from lane + 2
+    mov.u32         %r9, 2;
+    shfl.sync.b32   %f5, %f4, %r9, %r8;
+    add.f32         %f4, %f4, %f5;
+
+    // Shuffle from lane + 1
+    mov.u32         %r9, 1;
+    shfl.sync.b32   %f5, %f4, %r9, %r8;
+    add.f32         %f4, %f4, %f5;
+
+    // Lane 0 of each warp has partial sum in %f4
+    // Use atomics to accumulate across warps
+    mov.u32         %r9, %tid.x;
+    rem.u32         %r10, %r9, 32;             // lane within warp
+    setp.ne.u32     %p2, %r10, 0;
+    @%p2 bra       $skip_atomic;
+
+    cvta.to.global.u64 %rd6, %rd3;
+    red.global.add.f32 [%rd6], %f4;
+
+$skip_atomic:
+    ret;
+}
+
+//----------------------------------------------------------------------------
+// kernel_conservation
+//   Computes conservation law: C = alpha * D^{-1} * A * v + (1-alpha) * v
+//   This is the core conservation spectral operator.
+//   Uses warp shuffles for the matrix-vector multiply phase.
+//----------------------------------------------------------------------------
+.visible .entry kernel_conservation(
+    .param .u64 adj_ptr,
+    .param .u64 inv_deg_ptr,
+    .param .u64 v_in_ptr,
+    .param .u64 v_out_ptr,
+    .param .f32 alpha,
+    .param .u32 n_nodes
+)
+{
+    .reg .u64   %rd<8>;
+    .reg .u32   %r<12>;
+    .reg .f32   %f<24>;
+    .reg .pred  %p<4>;
+
+    ld.param.u64    %rd0, [adj_ptr];
+    ld.param.u64    %rd1, [inv_deg_ptr];
+    ld.param.u64    %rd2, [v_in_ptr];
+    ld.param.u64    %rd3, [v_out_ptr];
+    ld.param.f32    %f16, [alpha];          // f16 = alpha
+    ld.param.u32    %r0, [n_nodes];
+
+    // Thread id
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.u32      %r4, %r1, %r2, %r3;
+
+    setp.ge.u32     %p0, %r4, %r0;
+    @%p0 bra        $cons_exit;
+
+    // Step 1: Compute (A * v)[row]
+    mov.f32         %f0, 0f00000000;
+    mov.u32         %r5, 0;
+
+$av_loop:
+    setp.ge.u32     %p1, %r5, %r0;
+    @%p1 bra        $av_done;
+
+    mad.lo.u32      %r6, %r4, %r0, %r5;
+    shl.b32         %r7, %r6, 2;
+    add.u64         %rd4, %rd0, %r7;
+    cvta.to.global.u64 %rd4, %rd4;
+    ld.global.f32   %f1, [%rd4];           // A[row][j]
+
+    shl.b32         %r7, %r5, 2;
+    add.u64         %rd5, %rd2, %r7;
+    cvta.to.global.u64 %rd5, %rd5;
+    ld.global.f32   %f2, [%rd5];           // v[j]
+
+    fma.rn.f32      %f0, %f1, %f2, %f0;   // acc += A[row][j]*v[j]
+    add.u32         %r5, %r5, 1;
+    bra             $av_loop;
+
+$av_done:
+    // Step 2: Multiply by D^{-1}[row]
+    shl.b32         %r7, %r4, 2;
+    add.u64         %rd4, %rd1, %r7;
+    cvta.to.global.u64 %rd4, %rd4;
+    ld.global.f32   %f3, [%rd4];           // inv_deg[row]
+    mul.f32         %f4, %f0, %f3;         // f4 = D^{-1} A v [row]
+
+    // Step 3: Load v[row]
+    add.u64         %rd5, %rd2, %r7;
+    cvta.to.global.u64 %rd5, %rd5;
+    ld.global.f32   %f5, [%rd5];           // v[row]
+
+    // Step 4: alpha * D^{-1}Av + (1-alpha) * v
+    mov.f32         %f6, 0f3F800000;       // 1.0f
+    sub.f32         %f7, %f6, %f16;        // 1 - alpha
+    fma.rn.f32      %f8, %f16, %f4, %f0;  // alpha * D^{-1}Av (reuse f0 as temp? no)
+    // Actually: result = alpha * D^{-1}*A*v + (1-alpha)*v
+    mul.f32         %f9, %f7, %f5;         // (1-alpha)*v[row]
+    mul.f32         %f10, %f16, %f4;       // alpha * D^{-1}*A*v[row]
+    add.f32         %f11, %f10, %f9;       // result
+
+    // Store
+    add.u64         %rd4, %rd3, %r7;
+    cvta.to.global.u64 %rd4, %rd4;
+    st.global.f32   [%rd4], %f11;
+
+$cons_exit:
+    ret;
+}
